@@ -6,6 +6,8 @@ import time
 from collections import defaultdict
 from . import mask as maskUtils
 import copy
+import multiprocessing
+from functools import partial
 
 class COCOeval:
     # Interface for evaluating detection on the Microsoft COCO dataset.
@@ -118,7 +120,7 @@ class COCOeval:
         self.evalImgs = defaultdict(list)   # per-image per-category evaluation results
         self.eval     = {}                  # accumulated evaluation results
 
-    def evaluate(self):
+    def evaluate(self, num_processes=1):
         '''
         Run per image evaluation on given images and store results (a list of dict) in self.evalImgs
         :return: None
@@ -135,7 +137,7 @@ class COCOeval:
         if p.useCats:
             p.catIds = list(np.unique(p.catIds))
         p.maxDets = sorted(p.maxDets)
-        self.params=p
+        self.params = p
 
         self._prepare()
         # loop through images, area range, max detection number
@@ -145,21 +147,36 @@ class COCOeval:
             computeIoU = self.computeIoU
         elif p.iouType == 'keypoints':
             computeIoU = self.computeOks
-        self.ious = {(imgId, catId): computeIoU(imgId, catId) \
-                        for imgId in p.imgIds
-                        for catId in catIds}
+
+        # 使用多进程计算ious
+        print('Computing IoUs in parallel...')
+        pool = multiprocessing.Pool(num_processes)
+        iou_inputs = [(imgId, catId) for imgId in p.imgIds for catId in catIds]
+        iou_results = pool.starmap(computeIoU, iou_inputs)
+        self.ious = dict(zip(iou_inputs, iou_results))
+        pool.close()
+        pool.join()
 
         evaluateImg = self.evaluateImg
         maxDet = p.maxDets[-1]
-        self.evalImgs = [evaluateImg(imgId, catId, areaRng, maxDet)
-                 for catId in catIds
-                 for areaRng in p.areaRng
-                 for imgId in p.imgIds
-             ]
+
+        # 使用多进程计算evalImgs
+        print('Evaluating images in parallel...')
+        pool = multiprocessing.Pool(num_processes)
+        eval_inputs = [(imgId, catId, areaRng, maxDet)
+                    for catId in catIds
+                    for areaRng in p.areaRng
+                    for imgId in p.imgIds]
+        # 为了使evaluateImg能够被多进程调用，使用partial绑定self参数
+        eval_func = partial(evaluateImg_wrapper, self)
+        self.evalImgs = pool.map(eval_func, eval_inputs)
+        pool.close()
+        pool.join()
+
         self._paramsEval = copy.deepcopy(self.params)
         toc = time.time()
-        print('DONE (t={:0.2f}s).'.format(toc-tic))
-
+        print('DONE (t={:0.2f}s).'.format(toc - tic))
+    
     def computeIoU(self, imgId, catId):
         p = self.params
         if p.useCats:
@@ -188,7 +205,6 @@ class COCOeval:
         iscrowd = [int(o['iscrowd']) for o in gt]
         ious = maskUtils.iou(d,g,iscrowd)
         return ious
-
     def computeOks(self, imgId, catId):
         p = self.params
         # dimention here should be Nxm
@@ -375,8 +391,8 @@ class COCOeval:
                     tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
                     fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
 
-                    tp_sum = np.cumsum(tps, axis=1).astype(dtype=np.float)
-                    fp_sum = np.cumsum(fps, axis=1).astype(dtype=np.float)
+                    tp_sum = np.cumsum(tps, axis=1).astype(dtype=float)
+                    fp_sum = np.cumsum(fps, axis=1).astype(dtype=float)
                     for t, (tp, fp) in enumerate(zip(tp_sum, fp_sum)):
                         tp = np.array(tp)
                         fp = np.array(fp)
@@ -426,11 +442,11 @@ class COCOeval:
         '''
         def _summarize( ap=1, iouThr=None, areaRng='all', maxDets=100 ):
             p = self.params
-            iStr = ' {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:0.3f}'
+            iStr = ' {:<18} {} @[ IoU={:<9} | area={:>6s} | maxDets={:>3d} ] = {:0.4f}'
             titleStr = 'Average Precision' if ap == 1 else 'Average Recall'
             typeStr = '(AP)' if ap==1 else '(AR)'
-            iouStr = '{:0.2f}:{:0.2f}'.format(p.iouThrs[0], p.iouThrs[-1]) \
-                if iouThr is None else '{:0.2f}'.format(iouThr)
+            iouStr = '{:0.4f}:{:0.4f}'.format(p.iouThrs[0], p.iouThrs[-1]) \
+                if iouThr is None else '{:0.4f}'.format(iouThr)
 
             aind = [i for i, aRng in enumerate(p.areaRngLbl) if aRng == areaRng]
             mind = [i for i, mDet in enumerate(p.maxDets) if mDet == maxDets]
@@ -457,7 +473,7 @@ class COCOeval:
             return mean_s
         def _summarizeDets():
             stats = np.zeros((12,))
-            stats[0] = _summarize(1)
+            stats[0] = _summarize(1, maxDets=self.params.maxDets[2])
             stats[1] = _summarize(1, iouThr=.5, maxDets=self.params.maxDets[2])
             stats[2] = _summarize(1, iouThr=.75, maxDets=self.params.maxDets[2])
             stats[3] = _summarize(1, areaRng='small', maxDets=self.params.maxDets[2])
@@ -532,3 +548,7 @@ class Params:
         self.iouType = iouType
         # useSegm is deprecated
         self.useSegm = None
+
+def evaluateImg_wrapper(self, inputs):
+    imgId, catId, areaRng, maxDet = inputs
+    return self.evaluateImg(imgId, catId, areaRng, maxDet)
