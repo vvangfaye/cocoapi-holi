@@ -16,7 +16,7 @@ ext_modules = [
 setup(
     name='pycocotools_holi',
     packages=['pycocotools_holi'],
-    package_dir = {'pycocotools_holi': 'pycocotools'},
+    package_dir = {'pycocotools_holi': 'pycocotools_holi'},
     install_requires=[
         'setuptools>=18.0',
         'cython>=0.27.3',
